@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  db:
+    image: pgvector/pgvector:0.7.0-pg16
+    container_name: llm_memory_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: app_pass
+      POSTGRES_DB: app_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+
+  api:
+    build: ./api
+    container_name: llm_memory_api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://app_user:app_pass@db:5432/app_db
+    ports:
+      - "5433:5433"
+    depends_on:
+      - db
+    volumes:
+      - ./api:/app
+
+volumes:
+  db_data:
