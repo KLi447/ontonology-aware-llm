@@ -20,9 +20,10 @@ services:
     container_name: llm_memory_api
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://app_user:app_pass@db:5432/app_db
+      - DATABASE_URL=postgres://app_user:app_pass@db:5432/app_db
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     ports:
-      - "5433:5433"
+      - "8000:8000"
     depends_on:
       - db
     volumes:
