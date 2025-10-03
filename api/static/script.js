@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const refreshButton = document.getElementById('refresh-memories');
     const memoriesList = document.getElementById('memories-list');
     const sessionIdInput = document.getElementById('session_id');
+    const clearMemoriesButton = document.getElementById('clear-memories');
 
     const getSessionId = () => {
         let sessionId = sessionStorage.getItem('session_id');
@@ -104,6 +105,37 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error("Failed to fetch memories", error);
         }
     };
+
+    clearMemoriesButton.addEventListener('click', async () => {
+        const sessionId = getSessionId();
+        if (!sessionId) {
+            alert('No session ID found.');
+            return;
+        }
+
+        if (!confirm('Are you sure you want to delete all memories?')) {
+            return;
+        }
+
+        try {
+            const response = await fetch(`/memories/${sessionId}`, {
+                method: 'DELETE',
+            });
+
+            if (!response.ok) {
+                throw new Error('Failed to clear memories.');
+            }
+
+            const result = await response.json();
+            console.log(`Deleted ${result.deleted_count} memories.`);
+            
+            fetchMemories(); 
+
+        } catch (error) {
+            console.error('Error clearing memories:', error);
+            alert('Could not clear memories.');
+        }
+    });
     
     refreshButton.addEventListener('click', fetchMemories);
     fetchMemories();

@@ -22,19 +22,14 @@ else:
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://app_user:app_pass@db:5432/app_db")
 
 def convert_to_gemini_contents(history, system_instruction: str, user_prompt: str):
-    """
-    Convert OpenAI-style messages (system/user/assistant) into Gemini-compatible contents.
-    """
     contents = []
 
-    # System prompt → Gemini doesn't have "system", so encode it as a user message
     if system_instruction:
         contents.append({
             "role": "user",
             "parts": [{"text": system_instruction}]
         })
 
-    # Conversation history
     for role, content in history:
         if role == "assistant":
             contents.append({
@@ -198,3 +193,23 @@ def list_memories(limit: int = 10):
         }
         for r in rows
     ]
+
+@app.delete("/memories/{session_id}")
+def clear_memories(session_id: str):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM app.memories WHERE session_id = %s",
+            (session_id,),
+        )
+        deleted_rows = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"Cleared {deleted_rows} memories for session {session_id}")
+        return {"status": "success", "deleted_count": deleted_rows}
+    except Exception as e:
+        print(f"Error clearing memories: {e}")
+
+        return {"status": "error", "message": str(e)}
