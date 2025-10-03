@@ -21,6 +21,41 @@ else:
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://app_user:app_pass@db:5432/app_db")
 
+def convert_to_gemini_contents(history, system_instruction: str, user_prompt: str):
+    """
+    Convert OpenAI-style messages (system/user/assistant) into Gemini-compatible contents.
+    """
+    contents = []
+
+    # System prompt → Gemini doesn't have "system", so encode it as a user message
+    if system_instruction:
+        contents.append({
+            "role": "user",
+            "parts": [{"text": system_instruction}]
+        })
+
+    # Conversation history
+    for role, content in history:
+        if role == "assistant":
+            contents.append({
+                "role": "model",
+                "parts": [{"text": content}]
+            })
+        else:  # role == "user"
+            contents.append({
+                "role": "user",
+                "parts": [{"text": content}]
+            })
+
+    # Current user prompt
+    contents.append({
+        "role": "user",
+        "parts": [{"text": user_prompt}]
+    })
+
+    return contents
+
+
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
@@ -79,7 +114,7 @@ async def create_memory_from_conversation(session_id: str, user_prompt: str, ass
         
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=[{"role": "user", "parts": [prompt]}]
+            contents=prompt
         )
         memory_text = response.text.strip()
 
@@ -115,18 +150,13 @@ async def generate_response(req: GenerateRequest):
     memory_str = "Key memories for this user:\n" + "\n".join([f"- {m[0]}" for m in memories]) if memories else "No prior memories."
     system_instruction = f"You are a helpful assistant. Here is context about the user:\n{memory_str}"
 
-    gemini_history = [{"role": "system", "parts": [system_instruction]}]
-    for role, content in history:
-        gemini_history.append({
-            "role": "model" if role == "assistant" else "user",
-            "parts": [content]
-        })
+    contents = convert_to_gemini_contents(history, system_instruction, req.prompt)
 
     async def response_streamer():
         try:
-            stream = client.models.stream_generate_content(
+            stream = client.models.generate_content_stream(
                 model="gemini-2.5-flash",
-                contents=gemini_history + [{"role": "user", "parts": [req.prompt]}],
+                contents=contents,
             )
 
             full_response = ""

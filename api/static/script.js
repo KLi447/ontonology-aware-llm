@@ -4,6 +4,20 @@ document.addEventListener('DOMContentLoaded', () => {
     const chatWindow = document.getElementById('chat-window');
     const refreshButton = document.getElementById('refresh-memories');
     const memoriesList = document.getElementById('memories-list');
+    const sessionIdInput = document.getElementById('session_id');
+
+    const getSessionId = () => {
+        let sessionId = sessionStorage.getItem('session_id');
+        if (!sessionId) {
+            sessionId = crypto.randomUUID();
+            sessionStorage.setItem('session_id', sessionId);
+        }
+        return sessionId;
+    };
+
+    const currentSessionId = getSessionId();
+    sessionIdInput.value = currentSessionId;
+
 
     const addMessage = (role, text) => {
         const messageDiv = document.createElement('div');
@@ -24,12 +38,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const prompt = promptInput.value;
         if (!prompt) return;
 
-        const sessionId = document.getElementById('session_id').value;
-        if (!sessionId) {
-            alert('Please enter a Session ID');
-            return;
-        }
-
+        const sessionId = getSessionId();
+        
         addMessage('user', prompt);
         promptInput.value = '';
 
@@ -37,10 +47,6 @@ document.addEventListener('DOMContentLoaded', () => {
         assistantMessageContent.textContent = '';
 
         try {
-            const eventSource = new EventSource(`/generate?session_id=${encodeURIComponent(sessionId)}&prompt=${encodeURIComponent(prompt)}`, {
-                method: 'POST',
-            });
-            
             const response = await fetch('/generate', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -58,7 +64,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
                 
-                buffer = lines.pop();
+                buffer = lines.pop(); 
 
                 for (const line of lines) {
                     if (line.startsWith('data:')) {
@@ -79,9 +85,9 @@ document.addEventListener('DOMContentLoaded', () => {
             assistantMessageContent.textContent = 'Error: Could not get response.';
         }
     });
-
+    
     const fetchMemories = async () => {
-        const sessionId = document.getElementById('session_id').value;
+        const sessionId = getSessionId();
         if (!sessionId) return;
         
         try {
