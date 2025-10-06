@@ -1,7 +1,9 @@
 import os
 import psycopg2
 import json
-from fastapi import FastAPI
+import uuid
+from typing import List
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
@@ -21,69 +23,68 @@ else:
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://app_user:app_pass@db:5432/app_db")
 
-def convert_to_gemini_contents(history, system_instruction: str, user_prompt: str):
-    contents = []
+class ChatRequest(BaseModel):
+    session_id: str
+    prompt: str
 
-    if system_instruction:
-        contents.append({
-            "role": "user",
-            "parts": [{"text": system_instruction}]
-        })
-
-    for role, content in history:
-        if role == "assistant":
-            contents.append({
-                "role": "model",
-                "parts": [{"text": content}]
-            })
-        else:  # role == "user"
-            contents.append({
-                "role": "user",
-                "parts": [{"text": content}]
-            })
-
-    # Current user prompt
-    contents.append({
-        "role": "user",
-        "parts": [{"text": user_prompt}]
-    })
-
-    return contents
-
+class ConsolidateRequest(BaseModel):
+    user_id: str
+    session_ids: List[str]
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
+def get_embedding(text: str) -> List[float]:
+    """Generates an embedding for a given text."""
+    if not text:
+        return []
+    try:
+        result = client.models.embed_content(model="models/text-embedding-004", contents=text)
+        emb = result.embeddings[0].values
+        return emb + [0.0] * 768
+    except Exception as e:
+        print(f"Error generating embedding: {e}")
+        return []
+
 def add_chat_event_db(session_id: str, role: str, content: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO app.chat_events (session_id, role, content) VALUES (%s, %s, %s)",
-        (session_id, role, content),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    """Adds a chat event to the database."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO app.chat_events (session_id, role, content) VALUES (%s, %s, %s)",
+                (session_id, role, content),
+            )
 
 def create_memory_db(session_id: str, text: str, importance: float = 0.5):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO app.memories (session_id, kind, text, importance) VALUES (%s, %s, %s, %s)",
-        (session_id, 'reflection', text, importance),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    """Creates a memory and its embedding for a session."""
+    embedding = get_embedding(text)
+    if not embedding:
+        print("Skipping memory creation due to embedding failure.")
+        return
+        
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO app.memories (session_id, kind, text, importance, embedding) VALUES (%s, %s, %s, %s, %s)",
+                (session_id, 'reflection', text, importance, embedding),
+            )
     print(f"Memory created for session {session_id}: {text}")
+
+def convert_to_gemini_contents(history, system_instruction: str, user_prompt: str):
+    contents = []
+    if system_instruction:
+        contents.append({"role": "user", "parts": [{"text": system_instruction}]})
+    for role, content in history:
+        role = "model" if role == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": content}]})
+    contents.append({"role": "user", "parts": [{"text": user_prompt}]})
+    return contents
 
 app = FastAPI(title="LLM Memory API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -112,39 +113,28 @@ async def create_memory_from_conversation(session_id: str, user_prompt: str, ass
             contents=prompt
         )
         memory_text = response.text.strip()
-
         if memory_text and memory_text.upper() != "NULL":
             create_memory_db(session_id, memory_text)
     except Exception as e:
         print(f"Error creating memory with Gemini: {e}")
 
-@app.post("/generate")
-async def generate_response(req: GenerateRequest):
-    if not client:
-        async def error_stream():
-            yield "data: {\"error\": \"Gemini client not configured.\"}\n\n"
-        return StreamingResponse(error_stream(), media_type="text/event-stream")
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="Gemini client not configured.")
 
     add_chat_event_db(req.session_id, 'user', req.prompt)
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT role, content FROM app.chat_events WHERE session_id = %s ORDER BY created_at DESC LIMIT 10",
-        (req.session_id,),
-    )
-    history = cur.fetchall()[::-1]
-    cur.execute(
-        "SELECT text FROM app.memories WHERE session_id = %s ORDER BY created_at DESC LIMIT 5",
-        (req.session_id,),
-    )
-    memories = cur.fetchall()
-    cur.close()
-    conn.close()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT role, content FROM app.chat_events WHERE session_id = %s ORDER BY created_at DESC LIMIT 10", (req.session_id,))
+            history = cur.fetchall()[::-1]
 
-    memory_str = "Key memories for this user:\n" + "\n".join([f"- {m[0]}" for m in memories]) if memories else "No prior memories."
-    system_instruction = f"You are a helpful assistant. Here is context about the user:\n{memory_str}"
+            cur.execute("SELECT text FROM app.memories WHERE session_id = %s ORDER BY created_at DESC LIMIT 5", (req.session_id,))
+            memories = cur.fetchall()
 
+    memory_str = "Key memories from this session:\n" + "\n".join([f"- {m[0]}" for m in memories]) if memories else "No prior memories from this session."
+    system_instruction = f"You are a helpful assistant.\n{memory_str}"
     contents = convert_to_gemini_contents(history, system_instruction, req.prompt)
 
     async def response_streamer():
@@ -162,54 +152,90 @@ async def generate_response(req: GenerateRequest):
 
             add_chat_event_db(req.session_id, 'assistant', full_response)
             await create_memory_from_conversation(req.session_id, req.prompt, full_response)
-
             yield f"data: {json.dumps({'status': 'done'})}\n\n"
-
         except Exception as e:
             print(f"Error during Gemini stream: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-    return StreamingResponse(response_streamer(), media_type="text/event-stream")
+    return StreamingResponse(response_streamer(), media_type="text-event-stream")
 
 @app.get("/memories")
-def list_memories(limit: int = 10):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT memory_id, session_id, kind, text, importance, created_at FROM app.memories ORDER BY created_at DESC LIMIT %s",
-        (limit,),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+def list_memories(session_id: str, limit: int = 10):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT memory_id, session_id, kind, text, importance, created_at 
+                FROM app.memories 
+                WHERE session_id = %s ORDER BY created_at DESC LIMIT %s
+                """,
+                (session_id, limit,),
+            )
+            rows = cur.fetchall()
     return [
         {
             "memory_id": r[0],
-            "session_id": r[1],
+            "session_id": str(r[1]),
             "kind": r[2],
             "text": r[3],
             "importance": float(r[4]),
-            "created_at": r[5],
+            "created_at": r[5].isoformat(),
         }
         for r in rows
     ]
 
 @app.delete("/memories/{session_id}")
-def clear_memories(session_id: str):
+def clear_session_memories(session_id: str):
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM app.memories WHERE session_id = %s",
-            (session_id,),
-        )
-        deleted_rows = cur.rowcount
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM app.memories WHERE session_id = %s", (session_id,))
+                deleted_rows = cur.rowcount
         print(f"Cleared {deleted_rows} memories for session {session_id}")
         return {"status": "success", "deleted_count": deleted_rows}
     except Exception as e:
         print(f"Error clearing memories: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        return {"status": "error", "message": str(e)}
+@app.post("/consolidate")
+async def consolidate_memories(req: ConsolidateRequest):
+    if not client:
+        raise HTTPException(status_code=500, detail="Gemini client not configured.")
+        
+    if not req.session_ids:
+        return {"status": "success", "message": "No session IDs provided to consolidate."}
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT role, content FROM app.chat_events WHERE session_id::text = ANY(%s) ORDER BY created_at",
+                    (req.session_ids,)
+                )
+                full_history = cur.fetchall()
+        
+        if not full_history:
+             return {"status": "success", "message": "No chat history found for the provided sessions."}
+
+        conversation_text = "\n".join([f"{role}: {content}" for role, content in full_history])
+        prompt = f"Please provide a concise, high-level summary of the key topics, facts, and user preferences from the following conversation history:\n\n{conversation_text}"
+        
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        summary_text = response.text.strip()
+        
+        summary_embedding = get_embedding(summary_text)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO app.memory_summaries (user_id, session_window, summary, embedding) VALUES (%s, %s, %s, %s)",
+                    (req.user_id, len(req.session_ids), summary_text, summary_embedding)
+                )
+
+        return {"status": "success", "user_id": req.user_id, "summary": summary_text}
+    except Exception as e:
+        print(f"Error during consolidation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
