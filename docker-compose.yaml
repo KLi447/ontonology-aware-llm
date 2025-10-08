@@ -3,7 +3,7 @@ version: "3.9"
 services:
   db:
     image: pgvector/pgvector:0.7.0-pg16
-    container_name: llm_memory_db
+    container_name: unified_db
     restart: unless-stopped
     environment:
       POSTGRES_USER: app_user

@@ -42,8 +42,8 @@ CREATE TABLE IF NOT EXISTS app.memory_summaries (
 
 CREATE INDEX IF NOT EXISTS idx_memories_embedding
   ON app.memories
-  USING ivfflat (embedding vector_cosine);
+  USING ivfflat (embedding vector_cosine_ops);
 
 CREATE INDEX IF NOT EXISTS idx_memory_summaries_embedding
   ON app.memory_summaries
-  USING ivfflat (embedding vector_cosine);
+  USING ivfflat (embedding vector_cosine_ops);

@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
+import contextlib
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 client = None
@@ -23,6 +24,16 @@ else:
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://app_user:app_pass@db:5432/app_db")
 
+@contextlib.contextmanager
+def get_conn(schema: str = "public"):
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema}, public;")
+        yield conn
+    finally:
+        conn.close()
+
 class ChatRequest(BaseModel):
     session_id: str
     prompt: str
@@ -31,11 +42,7 @@ class ConsolidateRequest(BaseModel):
     user_id: str
     session_ids: List[str]
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
-
 def get_embedding(text: str) -> List[float]:
-    """Generates an embedding for a given text."""
     if not text:
         return []
     try:
@@ -46,28 +53,53 @@ def get_embedding(text: str) -> List[float]:
         print(f"Error generating embedding: {e}")
         return []
 
+def get_recent_business_context():
+    with get_conn("domain") as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+                    c.name AS customer_name, 
+                    c.industry,
+                    so.title AS order_title, 
+                    so.status, 
+                    so.created_at
+                FROM domain.customers c
+                JOIN domain.sales_orders so ON so.customer_id = c.customer_id
+                ORDER BY so.created_at DESC
+                LIMIT 5
+            """)
+            rows = cur.fetchall()
+    if not rows:
+        return "No recent data found."
+    
+    lines = [
+        f"{name} ({industry}) — {order_title} [{status}] created {created_at:%Y-%m-%d}"
+        for name, industry, order_title, status, created_at in rows
+    ]
+    return "Recent business data:\n" + "\n".join(lines)
+
 def add_chat_event_db(session_id: str, role: str, content: str):
-    """Adds a chat event to the database."""
-    with get_conn() as conn:
+    with get_conn("app") as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO app.chat_events (session_id, role, content) VALUES (%s, %s, %s)",
                 (session_id, role, content),
             )
+            conn.commit()
 
 def create_memory_db(session_id: str, text: str, importance: float = 0.5):
-    """Creates a memory and its embedding for a session."""
     embedding = get_embedding(text)
     if not embedding:
         print("Skipping memory creation due to embedding failure.")
         return
         
-    with get_conn() as conn:
+    with get_conn("app") as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO app.memories (session_id, kind, text, importance, embedding) VALUES (%s, %s, %s, %s, %s)",
                 (session_id, 'reflection', text, importance, embedding),
             )
+            conn.commit()
     print(f"Memory created for session {session_id}: {text}")
 
 def convert_to_gemini_contents(history, system_instruction: str, user_prompt: str):
@@ -118,6 +150,76 @@ async def create_memory_from_conversation(session_id: str, user_prompt: str, ass
     except Exception as e:
         print(f"Error creating memory with Gemini: {e}")
 
+def maybe_add_domain_entry(session_id: str, user_prompt: str, assistant_response: str):
+    if not client:
+        return
+    
+    try:
+        system_prompt = """
+        You are a structured data extraction agent.
+        Based on the following conversation, determine if there are any NEW or UPDATED business facts relevant to the company's domain database.
+        Respond ONLY in JSON or the string "NONE".
+        
+        Expected JSON schema example:
+        {
+            "customers": [
+                {"name": "Acme Corp", "industry": "Manufacturing"}
+            ],
+            "sales_orders": [
+                {"customer_name": "Acme Corp", "title": "Order for 100 widgets", "status": "pending"}
+            ]
+        }
+        Respond "NONE" if no relevant updates exist.
+        """
+
+        conversation_summary = f"User: {user_prompt}\nAssistant: {assistant_response}"
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[{"role": "user", "parts": [{"text": system_prompt + '\n\n' + conversation_summary}]}]
+        )
+
+        text = response.text.strip()
+        if not text or text.upper() == "NONE":
+            print("No new domain data detected.")
+            return
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            print("Gemini output not valid JSON, skipping domain update.")
+            return
+
+        with get_conn("domain") as conn:
+            with conn.cursor() as cur:
+                if "customers" in data:
+                    for c in data["customers"]:
+                        cur.execute("""
+                            INSERT INTO domain.customers (name, industry)
+                            VALUES (%s, %s)
+                            ON CONFLICT (name) DO NOTHING;
+                        """, (c.get("name"), c.get("industry")))
+
+                if "sales_orders" in data:
+                    for o in data["sales_orders"]:
+                        cur.execute("SELECT customer_id FROM domain.customers WHERE name = %s", (o.get("customer_name"),))
+                        res = cur.fetchone()
+                        if not res:
+                            print(f"Skipping order for unknown customer {o.get('customer_name')}")
+                            continue
+                        customer_id = res[0]
+
+                        cur.execute("""
+                            INSERT INTO domain.sales_orders (customer_id, title, status)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT DO NOTHING;
+                        """, (customer_id, o.get("title"), o.get("status")))
+
+                conn.commit()
+        print("Domain DB updated successfully.")
+    except Exception as e:
+        print(f"Error updating domain DB: {e}")
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
     if not GOOGLE_API_KEY:
@@ -125,7 +227,7 @@ async def chat(req: ChatRequest):
 
     add_chat_event_db(req.session_id, 'user', req.prompt)
 
-    with get_conn() as conn:
+    with get_conn("app") as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT role, content FROM app.chat_events WHERE session_id = %s ORDER BY created_at DESC LIMIT 10", (req.session_id,))
             history = cur.fetchall()[::-1]
@@ -134,7 +236,11 @@ async def chat(req: ChatRequest):
             memories = cur.fetchall()
 
     memory_str = "Key memories from this session:\n" + "\n".join([f"- {m[0]}" for m in memories]) if memories else "No prior memories from this session."
-    system_instruction = f"You are a helpful assistant.\n{memory_str}"
+    domain_context = get_recent_business_context()
+
+    print(memory_str)
+
+    system_instruction = f"You are a helpful assistant.\n{memory_str}. Use the following company data to inform your responses: {domain_context}"
     contents = convert_to_gemini_contents(history, system_instruction, req.prompt)
 
     async def response_streamer():
@@ -152,6 +258,7 @@ async def chat(req: ChatRequest):
 
             add_chat_event_db(req.session_id, 'assistant', full_response)
             await create_memory_from_conversation(req.session_id, req.prompt, full_response)
+            maybe_add_domain_entry(req.session_id, req.prompt, full_response)
             yield f"data: {json.dumps({'status': 'done'})}\n\n"
         except Exception as e:
             print(f"Error during Gemini stream: {e}")
@@ -161,7 +268,7 @@ async def chat(req: ChatRequest):
 
 @app.get("/memories")
 def list_memories(session_id: str, limit: int = 10):
-    with get_conn() as conn:
+    with get_conn("app") as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -187,7 +294,7 @@ def list_memories(session_id: str, limit: int = 10):
 @app.delete("/memories/{session_id}")
 def clear_session_memories(session_id: str):
     try:
-        with get_conn() as conn:
+        with get_conn("app") as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM app.memories WHERE session_id = %s", (session_id,))
                 deleted_rows = cur.rowcount
@@ -206,7 +313,7 @@ async def consolidate_memories(req: ConsolidateRequest):
         return {"status": "success", "message": "No session IDs provided to consolidate."}
 
     try:
-        with get_conn() as conn:
+        with get_conn("app") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT role, content FROM app.chat_events WHERE session_id::text = ANY(%s) ORDER BY created_at",
@@ -228,7 +335,7 @@ async def consolidate_memories(req: ConsolidateRequest):
         
         summary_embedding = get_embedding(summary_text)
 
-        with get_conn() as conn:
+        with get_conn("app") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO app.memory_summaries (user_id, session_window, summary, embedding) VALUES (%s, %s, %s, %s)",
